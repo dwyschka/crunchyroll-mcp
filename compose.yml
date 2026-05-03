@@ -1,0 +1,15 @@
+services:
+  mcp-crunchyroll:
+    build: .
+    container_name: mcp-crunchyroll-proxy
+    restart: unless-stopped
+    ports:
+      - "8808:8808"
+    environment:
+      - CRUNCHYROLL_EMAIL=${CRUNCHYROLL_EMAIL}
+      - CRUNCHYROLL_PASSWORD=${CRUNCHYROLL_PASSWORD}
+    volumes:
+      - crunchyroll_session:/root/.crunchyroll-mcp
+
+volumes:
+  crunchyroll_session:
