@@ -2,9 +2,9 @@
 FROM rust:slim-bookworm AS builder
 
 WORKDIR /app
-COPY Cargo.toml .
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM python:3.12-slim

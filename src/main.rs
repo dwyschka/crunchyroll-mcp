@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crunchyroll_rs::{
     Crunchyroll, Locale, MediaCollection, MovieListing, Season, Series,
-    crunchyroll::DeviceIdentifier,
+    auth::DeviceIdentifier,
     list::WatchlistOptions,
     search::{BrowseMediaType, BrowseOptions, BrowseSortType},
 };
@@ -103,7 +103,7 @@ async fn login_with_refresh(
 }
 
 async fn extract_refresh_token(cr: &Crunchyroll) -> String {
-    use crunchyroll_rs::crunchyroll::SessionToken;
+    use crunchyroll_rs::auth::SessionToken;
     match cr.session_token().await {
         SessionToken::RefreshToken(token) => token,
         _ => String::new(),

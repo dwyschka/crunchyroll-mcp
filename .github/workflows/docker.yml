@@ -3,6 +3,9 @@ name: Build & Push Docker Image
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
 
 jobs:
   build:
