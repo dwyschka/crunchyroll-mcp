@@ -110,6 +110,62 @@ async fn extract_refresh_token(cr: &Crunchyroll) -> String {
     }
 }
 
+// ── Auto re-login ─────────────────────────────────────────────────────────────
+
+fn env_credentials() -> Option<(String, String)> {
+    let email = std::env::var("CRUNCHYROLL_EMAIL").ok().filter(|v| !v.is_empty())?;
+    let password = std::env::var("CRUNCHYROLL_PASSWORD").ok().filter(|v| !v.is_empty())?;
+    Some((email, password))
+}
+
+/// Logs in with the credentials from the environment and stores the new session.
+async fn login_from_env(state: &SharedState) -> Result<Crunchyroll, String> {
+    let (email, password) =
+        env_credentials().ok_or("Not logged in. Use crunchyroll_login first.")?;
+    let (device_id, device_type) = {
+        let s = state.lock().await;
+        (s.device_id.clone(), s.device_type.clone())
+    };
+
+    eprintln!("Logging in with credentials from environment...");
+    let cr = login_with_credentials(&email, &password, &device_id, &device_type)
+        .await
+        .map_err(|e| format!("Not logged in. Auto-login from environment failed: {e}"))?;
+
+    let refresh_token = extract_refresh_token(&cr).await;
+    save_session(&PersistedSession {
+        refresh_token,
+        device_id,
+        device_type,
+    });
+    eprintln!("Auto-login successful");
+
+    state.lock().await.crunchyroll = Some(cr.clone());
+    Ok(cr)
+}
+
+/// Returns the active session, logging in from the environment if there is none.
+async fn current_session(state: &SharedState) -> Result<Crunchyroll, Value> {
+    if let Some(cr) = state.lock().await.crunchyroll.clone() {
+        return Ok(cr);
+    }
+    login_from_env(state).await.map_err(tool_err)
+}
+
+/// Whether a tool result failed because the session is expired or was revoked.
+fn is_auth_error(result: &Value) -> bool {
+    if result.get("isError").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    text.contains("(http 401)")
+        || text.contains("authentication error")
+        || text.contains("/auth/v1/token")
+}
+
 // ── MCP helpers ───────────────────────────────────────────────────────────────
 
 fn tool_ok(text: impl Into<String>) -> Value {
@@ -353,12 +409,9 @@ async fn tool_logout(state: &SharedState) -> Value {
 }
 
 async fn tool_status(state: &SharedState) -> Value {
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_ok("Not logged in"),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     let is_premium = cr.premium().await;
@@ -378,12 +431,9 @@ async fn tool_search(args: &Value, state: &SharedState) -> Value {
     };
     let limit = get_u64(args, "limit").unwrap_or(20) as usize;
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     let results_stream = cr.query(&query).top_results;
@@ -406,12 +456,9 @@ async fn tool_search(args: &Value, state: &SharedState) -> Value {
 async fn tool_browse(args: &Value, state: &SharedState) -> Value {
     let limit = get_u64(args, "limit").unwrap_or(20) as usize;
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     let mut options = BrowseOptions::default();
@@ -467,12 +514,9 @@ async fn tool_browse(args: &Value, state: &SharedState) -> Value {
 }
 
 async fn tool_get_categories(state: &SharedState) -> Value {
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr.categories().await {
@@ -495,12 +539,9 @@ async fn tool_get_categories(state: &SharedState) -> Value {
 }
 
 async fn tool_get_simulcast_seasons(state: &SharedState) -> Value {
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr.simulcast_seasons(Locale::en_US).await {
@@ -527,12 +568,9 @@ async fn tool_get_series(args: &Value, state: &SharedState) -> Value {
         None => return tool_err("Missing required parameter: series_id"),
     };
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr.media_from_id::<Series>(&series_id).await {
@@ -563,12 +601,9 @@ async fn tool_get_seasons(args: &Value, state: &SharedState) -> Value {
         None => return tool_err("Missing required parameter: series_id"),
     };
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr.media_from_id::<Series>(&series_id).await {
@@ -603,12 +638,9 @@ async fn tool_get_episodes(args: &Value, state: &SharedState) -> Value {
         None => return tool_err("Missing required parameter: season_id"),
     };
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr.media_from_id::<Season>(&season_id).await {
@@ -648,12 +680,9 @@ async fn tool_get_episode(args: &Value, state: &SharedState) -> Value {
         None => return tool_err("Missing required parameter: episode_id"),
     };
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     use crunchyroll_rs::Episode;
@@ -680,12 +709,9 @@ async fn tool_get_episode(args: &Value, state: &SharedState) -> Value {
 }
 
 async fn tool_get_watchlist(state: &SharedState) -> Value {
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr.watchlist(WatchlistOptions::default()).await {
@@ -725,12 +751,9 @@ async fn tool_add_to_watchlist(args: &Value, state: &SharedState) -> Value {
         None => return tool_err("Missing required parameter: content_id"),
     };
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     // Try as Series first, then MovieListing
@@ -757,12 +780,9 @@ async fn tool_remove_from_watchlist(args: &Value, state: &SharedState) -> Value 
         None => return tool_err("Missing required parameter: content_id"),
     };
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     // Try as Series first
@@ -795,12 +815,9 @@ async fn tool_remove_from_watchlist(args: &Value, state: &SharedState) -> Value 
 async fn tool_get_history(args: &Value, state: &SharedState) -> Value {
     let limit = get_u64(args, "limit").unwrap_or(20) as usize;
 
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr
@@ -830,12 +847,9 @@ async fn tool_get_history(args: &Value, state: &SharedState) -> Value {
 }
 
 async fn tool_get_subscription(state: &SharedState) -> Value {
-    let cr = {
-        let s = state.lock().await;
-        match &s.crunchyroll {
-            Some(cr) => cr.clone(),
-            None => return tool_err("Not logged in. Use crunchyroll_login first."),
-        }
+    let cr = match current_session(state).await {
+        Ok(cr) => cr,
+        Err(e) => return e,
     };
 
     match cr.billing_history().await {
@@ -912,6 +926,24 @@ fn simplify_search_result(item: &crunchyroll_rs::search::SearchMediaCollection) 
 // ── MCP protocol dispatch ─────────────────────────────────────────────────────
 
 async fn dispatch_tool(name: &str, args: &Value, state: &SharedState) -> Value {
+    let had_session = state.lock().await.crunchyroll.is_some();
+    let result = run_tool(name, args, state).await;
+
+    // Session expired or was revoked: log in again from the environment and retry once.
+    let is_session_tool = matches!(name, "crunchyroll_login" | "crunchyroll_logout");
+    if had_session && !is_session_tool && is_auth_error(&result) && env_credentials().is_some() {
+        eprintln!("Session no longer valid, re-authenticating...");
+        state.lock().await.crunchyroll = None;
+        if let Err(e) = login_from_env(state).await {
+            return tool_err(e);
+        }
+        return run_tool(name, args, state).await;
+    }
+
+    result
+}
+
+async fn run_tool(name: &str, args: &Value, state: &SharedState) -> Value {
     match name {
         "crunchyroll_login" => tool_login(args, state).await,
         "crunchyroll_logout" => tool_logout(state).await,
@@ -993,50 +1025,41 @@ async fn main() -> Result<()> {
         device_type: device_type.clone(),
     };
 
-    // Try env-var login first (useful for Docker deployments)
-    let env_email = std::env::var("CRUNCHYROLL_EMAIL").ok();
-    let env_password = std::env::var("CRUNCHYROLL_PASSWORD").ok();
+    // Without env credentials, fall back to the saved session
+    if env_credentials().is_none() {
+        if let Some(session) = load_session() {
+            eprintln!("Attempting login from saved session...");
+            match login_with_refresh(&session.refresh_token, &session.device_id, &session.device_type)
+                .await
+            {
+                Ok(cr) => {
+                    // Update device_id/type to match session
+                    state_inner.device_id = session.device_id.clone();
+                    state_inner.device_type = session.device_type.clone();
 
-    if let (Some(email), Some(password)) = (env_email, env_password) {
-        eprintln!("Attempting auto-login from environment variables...");
-        match login_with_credentials(&email, &password, &device_id, &device_type).await {
-            Ok(cr) => {
-                let refresh_token = extract_refresh_token(&cr).await;
-                save_session(&PersistedSession {
-                    refresh_token,
-                    device_id: device_id.clone(),
-                    device_type: device_type.clone(),
-                });
-                eprintln!("Auto-login successful");
-                state_inner.crunchyroll = Some(cr);
+                    let new_refresh = extract_refresh_token(&cr).await;
+                    save_session(&PersistedSession {
+                        refresh_token: new_refresh,
+                        device_id: session.device_id,
+                        device_type: session.device_type,
+                    });
+                    eprintln!("Session login successful");
+                    state_inner.crunchyroll = Some(cr);
+                }
+                Err(e) => eprintln!("Session login failed: {e}"),
             }
-            Err(e) => eprintln!("Auto-login failed: {e}"),
-        }
-    } else if let Some(session) = load_session() {
-        // Try saved session
-        eprintln!("Attempting login from saved session...");
-        match login_with_refresh(&session.refresh_token, &session.device_id, &session.device_type)
-            .await
-        {
-            Ok(cr) => {
-                // Update device_id/type to match session
-                state_inner.device_id = session.device_id.clone();
-                state_inner.device_type = session.device_type.clone();
-
-                let new_refresh = extract_refresh_token(&cr).await;
-                save_session(&PersistedSession {
-                    refresh_token: new_refresh,
-                    device_id: session.device_id,
-                    device_type: session.device_type,
-                });
-                eprintln!("Session login successful");
-                state_inner.crunchyroll = Some(cr);
-            }
-            Err(e) => eprintln!("Session login failed: {e}"),
         }
     }
 
     let state: SharedState = Arc::new(Mutex::new(state_inner));
+
+    // Env credentials take precedence (useful for Docker deployments). If this fails,
+    // the next tool call retries the login.
+    if env_credentials().is_some() {
+        if let Err(e) = login_from_env(&state).await {
+            eprintln!("{e}");
+        }
+    }
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
