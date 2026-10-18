@@ -310,7 +310,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "crunchyroll_get_seasons",
-            "description": "Get all seasons for an anime series.",
+            "description": "Get all seasons for an anime series. Each season is returned in the preferred audio language; `versions` lists the season ID of every other audio language (dub).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -321,7 +321,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "crunchyroll_get_episodes",
-            "description": "Get all episodes for a season.",
+            "description": "Get all episodes for a season. Use a season ID from `versions` to get the episodes of a specific dub.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -332,7 +332,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "crunchyroll_get_episode",
-            "description": "Get detailed information about a specific episode.",
+            "description": "Get detailed information about a specific episode, including the episode ID of every audio language in `versions`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -644,7 +644,8 @@ async fn tool_get_seasons(args: &Value, state: &SharedState) -> Value {
                             "is_subbed": s.is_subbed,
                             "is_dubbed": s.is_dubbed,
                             "is_simulcast": s.is_simulcast,
-                            "audio_locales": s.audio_locales.iter().map(|l| l.to_string()).collect::<Vec<_>>()
+                            "audio_locales": s.audio_locales.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+                            "versions": season_versions(s)
                         })
                     })
                     .collect();
@@ -686,7 +687,8 @@ async fn tool_get_episodes(args: &Value, state: &SharedState) -> Value {
                             "audio_locale": ep.audio_locale.to_string(),
                             "duration_seconds": ep.duration.num_seconds(),
                             "episode_air_date": ep.episode_air_date.to_rfc3339(),
-                            "is_premium_only": ep.is_premium_only
+                            "is_premium_only": ep.is_premium_only,
+                            "versions": episode_versions(ep)
                         })
                     })
                     .collect();
@@ -726,7 +728,8 @@ async fn tool_get_episode(args: &Value, state: &SharedState) -> Value {
             "subtitle_locales": ep.subtitle_locales.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
             "duration_seconds": ep.duration.num_seconds(),
             "episode_air_date": ep.episode_air_date.to_rfc3339(),
-            "is_premium_only": ep.is_premium_only
+            "is_premium_only": ep.is_premium_only,
+            "versions": episode_versions(&ep)
         })),
         Err(e) => tool_err(format!("Failed to get episode: {e}")),
     }
@@ -901,6 +904,40 @@ async fn tool_get_subscription(state: &SharedState) -> Value {
         }
         Err(e) => tool_err(format!("Failed to get subscription info: {e}")),
     }
+}
+
+// ── Language versions ─────────────────────────────────────────────────────────
+
+/// The same season in every audio language, each with its own season ID.
+fn season_versions(season: &Season) -> Vec<Value> {
+    season
+        .versions
+        .iter()
+        .map(|v| {
+            json!({
+                "id": v.id,
+                "audio_locale": v.audio_locale.to_string(),
+                "original": v.original
+            })
+        })
+        .collect()
+}
+
+/// The same episode in every audio language, each with its own episode ID.
+fn episode_versions(episode: &crunchyroll_rs::Episode) -> Vec<Value> {
+    episode
+        .versions
+        .iter()
+        .map(|v| {
+            json!({
+                "id": v.id,
+                "season_id": v.season_id,
+                "audio_locale": v.audio_locale.to_string(),
+                "original": v.original,
+                "is_premium_only": v.is_premium_only
+            })
+        })
+        .collect()
 }
 
 // ── Search result simplifier ──────────────────────────────────────────────────
