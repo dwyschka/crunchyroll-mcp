@@ -1,6 +1,6 @@
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use anyhow::Result;
@@ -55,6 +55,30 @@ fn clear_session() {
     let _ = std::fs::remove_file(session_path());
 }
 
+// ── Language settings ────────────────────────────────────────────────────────
+
+/// Language for titles, descriptions and category names.
+static LOCALE: LazyLock<Locale> =
+    LazyLock::new(|| env_locale("CRUNCHYROLL_LOCALE", Locale::en_US));
+
+/// Preferred audio language when a series or episode has several versions.
+static AUDIO_LOCALE: LazyLock<Locale> =
+    LazyLock::new(|| env_locale("CRUNCHYROLL_AUDIO_LOCALE", Locale::ja_JP));
+
+/// Reads a locale like `de-DE` (or `de_DE`) from the environment.
+fn env_locale(key: &str, default: Locale) -> Locale {
+    let Some(value) = std::env::var(key).ok().filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    let locale = Locale::from(value.replace('_', "-"));
+    if Locale::all().contains(&locale) {
+        locale
+    } else {
+        eprintln!("Unknown locale in {key}: '{value}', falling back to {default}");
+        default
+    }
+}
+
 // ── Shared state ─────────────────────────────────────────────────────────────
 
 struct AppState {
@@ -82,8 +106,8 @@ async fn login_with_credentials(
     device_type: &str,
 ) -> Result<Crunchyroll> {
     let cr = Crunchyroll::builder()
-        .locale(Locale::en_US)
-        .preferred_audio_locale(Locale::ja_JP)
+        .locale(LOCALE.clone())
+        .preferred_audio_locale(AUDIO_LOCALE.clone())
         .login_with_credentials(email, password, make_device(device_id, device_type))
         .await?;
     Ok(cr)
@@ -95,8 +119,8 @@ async fn login_with_refresh(
     device_type: &str,
 ) -> Result<Crunchyroll> {
     let cr = Crunchyroll::builder()
-        .locale(Locale::en_US)
-        .preferred_audio_locale(Locale::ja_JP)
+        .locale(LOCALE.clone())
+        .preferred_audio_locale(AUDIO_LOCALE.clone())
         .login_with_refresh_token(refresh_token, make_device(device_id, device_type))
         .await?;
     Ok(cr)
@@ -544,7 +568,7 @@ async fn tool_get_simulcast_seasons(state: &SharedState) -> Value {
         Err(e) => return e,
     };
 
-    match cr.simulcast_seasons(Locale::en_US).await {
+    match cr.simulcast_seasons(LOCALE.clone()).await {
         Ok(seasons) => {
             let simplified: Vec<Value> = seasons
                 .iter()

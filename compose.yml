@@ -8,6 +8,8 @@ services:
     environment:
       - CRUNCHYROLL_EMAIL=${CRUNCHYROLL_EMAIL}
       - CRUNCHYROLL_PASSWORD=${CRUNCHYROLL_PASSWORD}
+      - CRUNCHYROLL_LOCALE=${CRUNCHYROLL_LOCALE:-en-US}
+      - CRUNCHYROLL_AUDIO_LOCALE=${CRUNCHYROLL_AUDIO_LOCALE:-ja-JP}
     volumes:
       - crunchyroll_session:/root/.crunchyroll-mcp
 
