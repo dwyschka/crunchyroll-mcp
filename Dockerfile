@@ -22,5 +22,6 @@ CMD ["mcp-proxy", \
      "--host", "0.0.0.0", \
      "--port", "8808", \
      "--allow-origin", "*", \
+     "--pass-environment", \
      "--", \
      "crunchyroll-mcp"]
