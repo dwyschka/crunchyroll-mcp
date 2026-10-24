@@ -197,6 +197,29 @@ async fn extract_refresh_token(cr: &Crunchyroll) -> String {
     }
 }
 
+/// Saves the current refresh token if Crunchyroll rotated it during a token refresh.
+async fn persist_refresh_token(state: &SharedState) {
+    let (cr, device_id, device_type) = {
+        let s = state.lock().await;
+        let Some(cr) = s.crunchyroll.clone() else {
+            return;
+        };
+        (cr, s.device_id.clone(), s.device_type.clone())
+    };
+
+    let refresh_token = extract_refresh_token(&cr).await;
+    if refresh_token.is_empty()
+        || load_session().is_some_and(|saved| saved.refresh_token == refresh_token)
+    {
+        return;
+    }
+    save_session(&PersistedSession {
+        refresh_token,
+        device_id,
+        device_type,
+    });
+}
+
 // ── Auto re-login ─────────────────────────────────────────────────────────────
 
 fn env_credentials() -> Option<(String, String)> {
@@ -1061,9 +1084,12 @@ async fn dispatch_tool(name: &str, args: &Value, state: &SharedState) -> Value {
         if let Err(e) = login_from_env(state).await {
             return tool_err(e);
         }
-        return run_tool(name, args, state).await;
+        let result = run_tool(name, args, state).await;
+        persist_refresh_token(state).await;
+        return result;
     }
 
+    persist_refresh_token(state).await;
     result
 }
 
