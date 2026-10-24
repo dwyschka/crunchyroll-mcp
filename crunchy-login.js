@@ -7,10 +7,37 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const http = require("node:http");
+const https = require("node:https");
 
 const CREDENTIALS_URL =
   "https://raw.githubusercontent.com/crunchy-labs/artifacts/refs/heads/main/credentials.json";
+const INDEX_URL = "https://www.crunchyroll.com";
 const TOKEN_URL = "https://www.crunchyroll.com/auth/v1/token";
+
+// Plain node:https instead of fetch, which adds sec-fetch-mode and accept-encoding on its own.
+// This sends exactly the headers given, like the reqwest client of crunchyroll-rs.
+function request(method, url, headers, body) {
+  const client = url.startsWith("https:") ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = client.request(url, { method, headers }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () =>
+        resolve({
+          status: res.statusCode,
+          statusText: res.statusMessage,
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          setCookies: res.headers["set-cookie"] ?? [],
+          text: Buffer.concat(chunks).toString("utf8"),
+        }),
+      );
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
 
 function loadEnvFile(file) {
   if (!fs.existsSync(file)) return {};
@@ -41,19 +68,15 @@ async function main() {
   const deviceId = crypto.randomUUID();
   // Same default headers as crunchyroll-rs.
   const defaultHeaders = {
-    Accept: "*/*",
-    "Accept-Language": "en-US,en;q=0.5",
-    Connection: "keep-alive",
-    "User-Agent": userAgent,
+    accept: "*/*",
+    "accept-language": "en-US,en;q=0.5",
+    connection: "keep-alive",
+    "user-agent": userAgent,
   };
 
   // crunchyroll-rs requests the index page first to get the cookies Cloudflare's bot check wants.
-  const index = await fetch("https://www.crunchyroll.com", { headers: defaultHeaders });
-  const cookies = index.headers
-    .getSetCookie()
-    .map((cookie) => cookie.split(";")[0])
-    .join("; ");
-  await index.arrayBuffer();
+  const index = await request("GET", INDEX_URL, defaultHeaders);
+  const cookies = index.setCookies.map((cookie) => cookie.split(";")[0]).join("; ");
 
   const body = new URLSearchParams({
     username: email,
@@ -62,7 +85,7 @@ async function main() {
     scope: "offline_access",
     device_id: deviceId,
     device_type: "ANDROIDTV",
-  });
+  }).toString();
 
   console.log(`App version:  ${credentials.version} (${credentials.version_code})`);
   console.log(`E-Mail:       ${email}`);
@@ -71,19 +94,22 @@ async function main() {
   console.log(`Index page:   ${index.status}, cookies: ${cookies || "none"}`);
   console.log(`POST ${TOKEN_URL}\n`);
 
-  const response = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: {
+  // Same headers and order as Executor::auth_with_credentials plus the client defaults.
+  const response = await request(
+    "POST",
+    TOKEN_URL,
+    {
+      authorization: `Basic ${credentials.basic_auth_token}`,
+      "content-type": "application/x-www-form-urlencoded",
+      "etp-anonymous-id": deviceId,
       ...defaultHeaders,
-      ...(cookies && { Cookie: cookies }),
-      Authorization: `Basic ${credentials.basic_auth_token}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "ETP-Anonymous-ID": deviceId,
+      ...(cookies && { cookie: cookies }),
+      "content-length": Buffer.byteLength(body),
     },
     body,
-  });
+  );
 
-  const text = await response.text();
+  const text = response.text;
   console.log(`-> ${response.status} ${response.statusText}`);
   try {
     const json = JSON.parse(text);
