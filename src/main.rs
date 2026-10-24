@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::{Arc, LazyLock},
     task::{Context, Poll},
@@ -8,7 +7,7 @@ use std::{
 
 use anyhow::Result;
 use futures_util::{StreamExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -17,49 +16,13 @@ use tokio::{
 use uuid::Uuid;
 
 use crunchyroll_rs::{
-    Crunchyroll, Locale, MediaCollection, MovieListing, Season, Series,
+    Crunchyroll, Locale, Season, Series,
     auth::{
         CrunchyrollBuilder, DeviceIdentifier, DevicePlatform, middleware::MiddlewareContext,
         platform_credentials::get_platform_credentials,
     },
-    list::WatchlistOptions,
     search::{BrowseMediaType, BrowseOptions, BrowseSortType},
 };
-
-// ── Session persistence ──────────────────────────────────────────────────────
-
-#[derive(Serialize, Deserialize, Clone)]
-struct PersistedSession {
-    refresh_token: String,
-    device_id: String,
-    device_type: String,
-}
-
-fn session_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".crunchyroll-mcp")
-        .join("session.json")
-}
-
-fn load_session() -> Option<PersistedSession> {
-    let content = std::fs::read_to_string(session_path()).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-fn save_session(session: &PersistedSession) {
-    let path = session_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(content) = serde_json::to_string_pretty(session) {
-        let _ = std::fs::write(path, content);
-    }
-}
-
-fn clear_session() {
-    let _ = std::fs::remove_file(session_path());
-}
 
 // ── Language settings ────────────────────────────────────────────────────────
 
@@ -92,7 +55,7 @@ static DEV_MODE: LazyLock<bool> = LazyLock::new(|| {
 
 // ── Dev logging ──────────────────────────────────────────────────────────────
 
-/// Request body for the dev log; form fields are decoded and the password is masked.
+/// Request body for the dev log; form fields are decoded one per line.
 fn request_params(request: &reqwest::Request) -> Option<String> {
     let body = request.body()?.as_bytes()?;
     let is_form = request
@@ -105,13 +68,7 @@ fn request_params(request: &reqwest::Request) -> Option<String> {
     }
 
     let fields = form_urlencoded::parse(body)
-        .map(|(key, value)| {
-            if key == "password" {
-                format!("  {key} = <{} Zeichen>", value.chars().count())
-            } else {
-                format!("  {key} = {value}")
-            }
-        })
+        .map(|(key, value)| format!("  {key} = {value}"))
         .collect::<Vec<_>>();
     Some(fields.join("\n"))
 }
@@ -213,117 +170,36 @@ async fn crunchyroll_builder() -> CrunchyrollBuilder {
 struct AppState {
     crunchyroll: Option<Crunchyroll>,
     device_id: String,
-    device_type: String,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
 
-fn make_device(device_id: &str, device_type: &str) -> DeviceIdentifier {
-    DeviceIdentifier {
-        device_id: device_id.to_string(),
-        device_type: device_type.to_string(),
+// ── Anonymous session ─────────────────────────────────────────────────────────
+
+/// Starts an anonymous session; the catalog is available without an account.
+async fn login_anonymously(state: &SharedState) -> Result<Crunchyroll, String> {
+    let device_id = state.lock().await.device_id.clone();
+    let device = DeviceIdentifier {
+        device_id,
+        device_type: "ANDROIDTV".to_string(),
         device_name: None,
-    }
-}
-
-// ── Login helpers ─────────────────────────────────────────────────────────────
-
-async fn login_with_credentials(
-    email: &str,
-    password: &str,
-    device_id: &str,
-    device_type: &str,
-) -> Result<Crunchyroll> {
+    };
     let cr = crunchyroll_builder()
         .await
-        .login_with_credentials(email, password, make_device(device_id, device_type))
-        .await?;
-    Ok(cr)
-}
-
-async fn login_with_refresh(
-    refresh_token: &str,
-    device_id: &str,
-    device_type: &str,
-) -> Result<Crunchyroll> {
-    let cr = crunchyroll_builder()
+        .login_anonymously(device)
         .await
-        .login_with_refresh_token(refresh_token, make_device(device_id, device_type))
-        .await?;
-    Ok(cr)
-}
-
-async fn extract_refresh_token(cr: &Crunchyroll) -> String {
-    use crunchyroll_rs::auth::SessionToken;
-    match cr.session_token().await {
-        SessionToken::RefreshToken(token) => token,
-        _ => String::new(),
-    }
-}
-
-/// Saves the current refresh token if Crunchyroll rotated it during a token refresh.
-async fn persist_refresh_token(state: &SharedState) {
-    let (cr, device_id, device_type) = {
-        let s = state.lock().await;
-        let Some(cr) = s.crunchyroll.clone() else {
-            return;
-        };
-        (cr, s.device_id.clone(), s.device_type.clone())
-    };
-
-    let refresh_token = extract_refresh_token(&cr).await;
-    if refresh_token.is_empty()
-        || load_session().is_some_and(|saved| saved.refresh_token == refresh_token)
-    {
-        return;
-    }
-    save_session(&PersistedSession {
-        refresh_token,
-        device_id,
-        device_type,
-    });
-}
-
-// ── Auto re-login ─────────────────────────────────────────────────────────────
-
-fn env_credentials() -> Option<(String, String)> {
-    let email = std::env::var("CRUNCHYROLL_EMAIL").ok().filter(|v| !v.is_empty())?;
-    let password = std::env::var("CRUNCHYROLL_PASSWORD").ok().filter(|v| !v.is_empty())?;
-    Some((email, password))
-}
-
-/// Logs in with the credentials from the environment and stores the new session.
-async fn login_from_env(state: &SharedState) -> Result<Crunchyroll, String> {
-    let (email, password) =
-        env_credentials().ok_or("Not logged in. Use crunchyroll_login first.")?;
-    let (device_id, device_type) = {
-        let s = state.lock().await;
-        (s.device_id.clone(), s.device_type.clone())
-    };
-
-    eprintln!("Logging in with credentials from environment...");
-    let cr = login_with_credentials(&email, &password, &device_id, &device_type)
-        .await
-        .map_err(|e| format!("Not logged in. Auto-login from environment failed: {e}"))?;
-
-    let refresh_token = extract_refresh_token(&cr).await;
-    save_session(&PersistedSession {
-        refresh_token,
-        device_id,
-        device_type,
-    });
-    eprintln!("Auto-login successful");
+        .map_err(|e| format!("Anonymous login failed: {e}"))?;
 
     state.lock().await.crunchyroll = Some(cr.clone());
     Ok(cr)
 }
 
-/// Returns the active session, logging in from the environment if there is none.
+/// Returns the active session, starting an anonymous one if there is none.
 async fn current_session(state: &SharedState) -> Result<Crunchyroll, Value> {
     if let Some(cr) = state.lock().await.crunchyroll.clone() {
         return Ok(cr);
     }
-    login_from_env(state).await.map_err(tool_err)
+    login_anonymously(state).await.map_err(tool_err)
 }
 
 /// Whether a tool result failed because the session is expired or was revoked.
@@ -373,28 +249,6 @@ fn get_u64(args: &Value, key: &str) -> Option<u64> {
 
 fn tools_list() -> Value {
     json!([
-        {
-            "name": "crunchyroll_login",
-            "description": "Login to Crunchyroll with email and password. Saves the session for future use.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "email": {"type": "string", "description": "Crunchyroll account email"},
-                    "password": {"type": "string", "description": "Crunchyroll account password"}
-                },
-                "required": ["email", "password"]
-            }
-        },
-        {
-            "name": "crunchyroll_logout",
-            "description": "Logout from Crunchyroll and clear the saved session.",
-            "inputSchema": {"type": "object", "properties": {}}
-        },
-        {
-            "name": "crunchyroll_status",
-            "description": "Check current Crunchyroll login status.",
-            "inputSchema": {"type": "object", "properties": {}}
-        },
         {
             "name": "crunchyroll_search",
             "description": "Search the Crunchyroll catalog for anime, movies, and episodes.",
@@ -490,113 +344,11 @@ fn tools_list() -> Value {
                 },
                 "required": ["episode_id"]
             }
-        },
-        {
-            "name": "crunchyroll_get_watchlist",
-            "description": "Get the current user's watchlist.",
-            "inputSchema": {"type": "object", "properties": {}}
-        },
-        {
-            "name": "crunchyroll_add_to_watchlist",
-            "description": "Add a series or movie to the watchlist.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "content_id": {"type": "string", "description": "Series or movie listing ID to add"}
-                },
-                "required": ["content_id"]
-            }
-        },
-        {
-            "name": "crunchyroll_remove_from_watchlist",
-            "description": "Remove a series or movie from the watchlist.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "content_id": {"type": "string", "description": "Series or movie listing ID to remove"}
-                },
-                "required": ["content_id"]
-            }
-        },
-        {
-            "name": "crunchyroll_get_history",
-            "description": "Get the watch history for the current user.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "number", "description": "Maximum number of entries (default: 20)"}
-                }
-            }
-        },
-        {
-            "name": "crunchyroll_get_subscription",
-            "description": "Get billing history and subscription information.",
-            "inputSchema": {"type": "object", "properties": {}}
         }
     ])
 }
 
 // ── Tool implementations ──────────────────────────────────────────────────────
-
-async fn tool_login(args: &Value, state: &SharedState) -> Value {
-    let email = match get_str(args, "email") {
-        Some(v) => v.to_string(),
-        None => return tool_err("Missing required parameter: email"),
-    };
-    let password = match get_str(args, "password") {
-        Some(v) => v.to_string(),
-        None => return tool_err("Missing required parameter: password"),
-    };
-
-    let (device_id, device_type) = {
-        let s = state.lock().await;
-        (s.device_id.clone(), s.device_type.clone())
-    };
-
-    match login_with_credentials(&email, &password, &device_id, &device_type).await {
-        Ok(cr) => {
-            let refresh_token = extract_refresh_token(&cr).await;
-            let is_premium = cr.premium().await;
-
-            save_session(&PersistedSession {
-                refresh_token,
-                device_id,
-                device_type,
-            });
-
-            let mut s = state.lock().await;
-            s.crunchyroll = Some(cr);
-
-            tool_ok(format!(
-                "Logged in successfully as {email}. Premium: {is_premium}"
-            ))
-        }
-        Err(e) => tool_err(format!("Login failed: {e}")),
-    }
-}
-
-async fn tool_logout(state: &SharedState) -> Value {
-    clear_session();
-    let mut s = state.lock().await;
-    s.crunchyroll = None;
-    tool_ok("Logged out successfully")
-}
-
-async fn tool_status(state: &SharedState) -> Value {
-    let cr = match current_session(state).await {
-        Ok(cr) => cr,
-        Err(e) => return e,
-    };
-
-    let is_premium = cr.premium().await;
-    match cr.account().await {
-        Ok(account) => tool_ok(format!(
-            "Logged in as {} ({}). Premium: {}",
-            account.email, account.account_id, is_premium
-        )),
-        Err(e) => tool_ok(format!("Logged in. Premium: {is_premium}. (Could not fetch account: {e})")),
-    }
-}
 
 async fn tool_search(args: &Value, state: &SharedState) -> Value {
     let query = match get_str(args, "query") {
@@ -885,177 +637,6 @@ async fn tool_get_episode(args: &Value, state: &SharedState) -> Value {
     }
 }
 
-async fn tool_get_watchlist(state: &SharedState) -> Value {
-    let cr = match current_session(state).await {
-        Ok(cr) => cr,
-        Err(e) => return e,
-    };
-
-    match cr.watchlist(WatchlistOptions::default()).await {
-        Ok(entries) => {
-            let simplified: Vec<Value> = entries
-                .iter()
-                .map(|e| {
-                    let (id, title, media_type) = match &e.panel {
-                        MediaCollection::Series(s) => {
-                            (s.id.clone(), s.title.clone(), "series")
-                        }
-                        MediaCollection::MovieListing(m) => {
-                            (m.id.clone(), m.title.clone(), "movie")
-                        }
-                        _ => ("".to_string(), "".to_string(), "unknown"),
-                    };
-                    json!({
-                        "id": id,
-                        "title": title,
-                        "type": media_type,
-                        "is_favorite": e.is_favorite,
-                        "never_watched": e.never_watched,
-                        "fully_watched": e.fully_watched,
-                        "playhead": e.playhead
-                    })
-                })
-                .collect();
-            tool_json(json!({"watchlist": simplified, "count": simplified.len()}))
-        }
-        Err(e) => tool_err(format!("Failed to get watchlist: {e}")),
-    }
-}
-
-async fn tool_add_to_watchlist(args: &Value, state: &SharedState) -> Value {
-    let content_id = match get_str(args, "content_id") {
-        Some(v) => v.to_string(),
-        None => return tool_err("Missing required parameter: content_id"),
-    };
-
-    let cr = match current_session(state).await {
-        Ok(cr) => cr,
-        Err(e) => return e,
-    };
-
-    // Try as Series first, then MovieListing
-    match cr.media_from_id::<Series>(&content_id).await {
-        Ok(series) => match series.add_to_watchlist().await {
-            Ok(()) => return tool_ok(format!("Added '{}' to watchlist", series.title)),
-            Err(e) => return tool_err(format!("Failed to add to watchlist: {e}")),
-        },
-        Err(_) => {}
-    }
-
-    match cr.media_from_id::<MovieListing>(&content_id).await {
-        Ok(movie) => match movie.add_to_watchlist().await {
-            Ok(()) => tool_ok(format!("Added '{}' to watchlist", movie.title)),
-            Err(e) => tool_err(format!("Failed to add to watchlist: {e}")),
-        },
-        Err(e) => tool_err(format!("Content not found (tried series and movie): {e}")),
-    }
-}
-
-async fn tool_remove_from_watchlist(args: &Value, state: &SharedState) -> Value {
-    let content_id = match get_str(args, "content_id") {
-        Some(v) => v.to_string(),
-        None => return tool_err("Missing required parameter: content_id"),
-    };
-
-    let cr = match current_session(state).await {
-        Ok(cr) => cr,
-        Err(e) => return e,
-    };
-
-    // Try as Series first
-    if let Ok(series) = cr.media_from_id::<Series>(&content_id).await {
-        match series.into_watchlist_entry().await {
-            Ok(Some(entry)) => match entry.remove().await {
-                Ok(()) => return tool_ok("Removed from watchlist"),
-                Err(e) => return tool_err(format!("Failed to remove: {e}")),
-            },
-            Ok(None) => return tool_err("Content is not in watchlist"),
-            Err(e) => return tool_err(format!("Failed to check watchlist: {e}")),
-        }
-    }
-
-    // Try as MovieListing
-    if let Ok(movie) = cr.media_from_id::<MovieListing>(&content_id).await {
-        match movie.into_watchlist_entry().await {
-            Ok(Some(entry)) => match entry.remove().await {
-                Ok(()) => return tool_ok("Removed from watchlist"),
-                Err(e) => return tool_err(format!("Failed to remove: {e}")),
-            },
-            Ok(None) => return tool_err("Content is not in watchlist"),
-            Err(e) => return tool_err(format!("Failed to check watchlist: {e}")),
-        }
-    }
-
-    tool_err("Content not found. Provide a valid series or movie ID.")
-}
-
-async fn tool_get_history(args: &Value, state: &SharedState) -> Value {
-    let limit = get_u64(args, "limit").unwrap_or(20) as usize;
-
-    let cr = match current_session(state).await {
-        Ok(cr) => cr,
-        Err(e) => return e,
-    };
-
-    match cr
-        .watch_history()
-        .take(limit)
-        .try_collect::<Vec<_>>()
-        .await
-    {
-        Ok(entries) => {
-            let simplified: Vec<Value> = entries
-                .iter()
-                .map(|e| {
-                    json!({
-                        "id": e.id,
-                        "parent_id": e.parent_id,
-                        "parent_type": e.parent_type,
-                        "date_played": e.date_played.to_rfc3339(),
-                        "playhead": e.playhead,
-                        "fully_watched": e.fully_watched
-                    })
-                })
-                .collect();
-            tool_json(json!({"history": simplified, "count": simplified.len()}))
-        }
-        Err(e) => tool_err(format!("Failed to get watch history: {e}")),
-    }
-}
-
-async fn tool_get_subscription(state: &SharedState) -> Value {
-    let cr = match current_session(state).await {
-        Ok(cr) => cr,
-        Err(e) => return e,
-    };
-
-    match cr.billing_history().await {
-        Ok(billing) => {
-            let invoices: Vec<Value> = billing
-                .invoices
-                .iter()
-                .map(|inv| {
-                    json!({
-                        "invoice_id": inv.invoice_id,
-                        "date": inv.invoice_date.to_rfc3339(),
-                        "amount": inv.amount,
-                        "currency": inv.currency_code,
-                        "status": inv.status,
-                        "plan": inv.description,
-                        "payment_method": inv.payment_info.payment_method_name
-                    })
-                })
-                .collect();
-            let is_premium = cr.premium().await;
-            tool_json(json!({
-                "is_premium": is_premium,
-                "billing_history": invoices
-            }))
-        }
-        Err(e) => tool_err(format!("Failed to get subscription info: {e}")),
-    }
-}
-
 // ── Language versions ─────────────────────────────────────────────────────────
 
 /// The same season in every audio language, each with its own season ID.
@@ -1140,28 +721,18 @@ async fn dispatch_tool(name: &str, args: &Value, state: &SharedState) -> Value {
     let had_session = state.lock().await.crunchyroll.is_some();
     let result = run_tool(name, args, state).await;
 
-    // Session expired or was revoked: log in again from the environment and retry once.
-    let is_session_tool = matches!(name, "crunchyroll_login" | "crunchyroll_logout");
-    if had_session && !is_session_tool && is_auth_error(&result) && env_credentials().is_some() {
-        eprintln!("Session no longer valid, re-authenticating...");
+    // Session expired or was revoked: start a new anonymous one and retry once.
+    if had_session && is_auth_error(&result) {
+        eprintln!("Session no longer valid, starting a new anonymous session...");
         state.lock().await.crunchyroll = None;
-        if let Err(e) = login_from_env(state).await {
-            return tool_err(e);
-        }
-        let result = run_tool(name, args, state).await;
-        persist_refresh_token(state).await;
-        return result;
+        return run_tool(name, args, state).await;
     }
 
-    persist_refresh_token(state).await;
     result
 }
 
 async fn run_tool(name: &str, args: &Value, state: &SharedState) -> Value {
     match name {
-        "crunchyroll_login" => tool_login(args, state).await,
-        "crunchyroll_logout" => tool_logout(state).await,
-        "crunchyroll_status" => tool_status(state).await,
         "crunchyroll_search" => tool_search(args, state).await,
         "crunchyroll_browse" => tool_browse(args, state).await,
         "crunchyroll_get_categories" => tool_get_categories(state).await,
@@ -1170,11 +741,6 @@ async fn run_tool(name: &str, args: &Value, state: &SharedState) -> Value {
         "crunchyroll_get_seasons" => tool_get_seasons(args, state).await,
         "crunchyroll_get_episodes" => tool_get_episodes(args, state).await,
         "crunchyroll_get_episode" => tool_get_episode(args, state).await,
-        "crunchyroll_get_watchlist" => tool_get_watchlist(state).await,
-        "crunchyroll_add_to_watchlist" => tool_add_to_watchlist(args, state).await,
-        "crunchyroll_remove_from_watchlist" => tool_remove_from_watchlist(args, state).await,
-        "crunchyroll_get_history" => tool_get_history(args, state).await,
-        "crunchyroll_get_subscription" => tool_get_subscription(state).await,
         unknown => tool_err(format!("Unknown tool: {unknown}")),
     }
 }
@@ -1230,49 +796,15 @@ async fn handle_request(msg: &Value, state: &SharedState) -> Option<Value> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let device_id = Uuid::new_v4().to_string();
-    let device_type = "ANDROIDTV".to_string();
-
-    let mut state_inner = AppState {
+    let state: SharedState = Arc::new(Mutex::new(AppState {
         crunchyroll: None,
-        device_id: device_id.clone(),
-        device_type: device_type.clone(),
-    };
+        device_id: Uuid::new_v4().to_string(),
+    }));
 
-    // Without env credentials, fall back to the saved session
-    if env_credentials().is_none() {
-        if let Some(session) = load_session() {
-            eprintln!("Attempting login from saved session...");
-            match login_with_refresh(&session.refresh_token, &session.device_id, &session.device_type)
-                .await
-            {
-                Ok(cr) => {
-                    // Update device_id/type to match session
-                    state_inner.device_id = session.device_id.clone();
-                    state_inner.device_type = session.device_type.clone();
-
-                    let new_refresh = extract_refresh_token(&cr).await;
-                    save_session(&PersistedSession {
-                        refresh_token: new_refresh,
-                        device_id: session.device_id,
-                        device_type: session.device_type,
-                    });
-                    eprintln!("Session login successful");
-                    state_inner.crunchyroll = Some(cr);
-                }
-                Err(e) => eprintln!("Session login failed: {e}"),
-            }
-        }
-    }
-
-    let state: SharedState = Arc::new(Mutex::new(state_inner));
-
-    // Env credentials take precedence (useful for Docker deployments). If this fails,
-    // the next tool call retries the login.
-    if env_credentials().is_some() {
-        if let Err(e) = login_from_env(&state).await {
-            eprintln!("{e}");
-        }
+    // If this fails, the next tool call tries again.
+    match login_anonymously(&state).await {
+        Ok(_) => eprintln!("Anonymous session started"),
+        Err(e) => eprintln!("{e}"),
     }
 
     let stdin = tokio::io::stdin();
