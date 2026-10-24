@@ -10,6 +10,7 @@ services:
       - CRUNCHYROLL_PASSWORD=${CRUNCHYROLL_PASSWORD}
       - CRUNCHYROLL_LOCALE=${CRUNCHYROLL_LOCALE:-en-US}
       - CRUNCHYROLL_AUDIO_LOCALE=${CRUNCHYROLL_AUDIO_LOCALE:-ja-JP}
+      - DEV_MODE=${DEV_MODE:-false}
     volumes:
       - crunchyroll_session:/root/.crunchyroll-mcp
 

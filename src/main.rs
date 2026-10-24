@@ -1,6 +1,9 @@
 use std::{
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     sync::{Arc, LazyLock},
+    task::{Context, Poll},
 };
 
 use anyhow::Result;
@@ -15,7 +18,7 @@ use uuid::Uuid;
 
 use crunchyroll_rs::{
     Crunchyroll, Locale, MediaCollection, MovieListing, Season, Series,
-    auth::DeviceIdentifier,
+    auth::{CrunchyrollBuilder, DeviceIdentifier, middleware::MiddlewareContext},
     list::WatchlistOptions,
     search::{BrowseMediaType, BrowseOptions, BrowseSortType},
 };
@@ -79,6 +82,70 @@ fn env_locale(key: &str, default: Locale) -> Locale {
     }
 }
 
+/// When `DEV_MODE=true`, every raw response from the Crunchyroll API is logged.
+static DEV_MODE: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("DEV_MODE").is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
+});
+
+// ── Dev logging ──────────────────────────────────────────────────────────────
+
+/// Middleware that logs each response body to stderr and passes it on unchanged.
+struct ResponseLogger;
+
+impl<'a> tower_service::Service<MiddlewareContext<'a>> for ResponseLogger {
+    type Response = reqwest::Response;
+    type Error = reqwest::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, ctx: MiddlewareContext<'a>) -> Self::Future {
+        let client = ctx.client.clone();
+        let request = ctx.request;
+        Box::pin(async move {
+            use reqwest::ResponseBuilderExt;
+
+            let method = request.method().clone();
+            let url = request.url().clone();
+            let resp = client.execute(request).await?;
+            let status = resp.status();
+            let version = resp.version();
+            let headers = resp.headers().clone();
+            let body = resp.bytes().await?;
+            eprintln!(
+                "[DEV] {method} {url} -> {status}\n{}",
+                String::from_utf8_lossy(&body)
+            );
+
+            let mut builder = http::Response::builder()
+                .status(status)
+                .version(version)
+                .url(url);
+            if let Some(h) = builder.headers_mut() {
+                *h = headers;
+            }
+            Ok(builder
+                .body(body)
+                .expect("response parts taken from a valid response")
+                .into())
+        })
+    }
+}
+
+/// Crunchyroll client builder with the configured locales (and the dev logger if enabled).
+fn crunchyroll_builder() -> CrunchyrollBuilder {
+    let builder = Crunchyroll::builder()
+        .locale(LOCALE.clone())
+        .preferred_audio_locale(AUDIO_LOCALE.clone());
+    if *DEV_MODE {
+        builder.middleware(ResponseLogger)
+    } else {
+        builder
+    }
+}
+
 // ── Shared state ─────────────────────────────────────────────────────────────
 
 struct AppState {
@@ -105,9 +172,7 @@ async fn login_with_credentials(
     device_id: &str,
     device_type: &str,
 ) -> Result<Crunchyroll> {
-    let cr = Crunchyroll::builder()
-        .locale(LOCALE.clone())
-        .preferred_audio_locale(AUDIO_LOCALE.clone())
+    let cr = crunchyroll_builder()
         .login_with_credentials(email, password, make_device(device_id, device_type))
         .await?;
     Ok(cr)
@@ -118,9 +183,7 @@ async fn login_with_refresh(
     device_id: &str,
     device_type: &str,
 ) -> Result<Crunchyroll> {
-    let cr = Crunchyroll::builder()
-        .locale(LOCALE.clone())
-        .preferred_audio_locale(AUDIO_LOCALE.clone())
+    let cr = crunchyroll_builder()
         .login_with_refresh_token(refresh_token, make_device(device_id, device_type))
         .await?;
     Ok(cr)

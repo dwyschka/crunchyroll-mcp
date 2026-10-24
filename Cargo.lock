@@ -300,9 +300,12 @@ dependencies = [
  "crunchyroll-rs",
  "dirs",
  "futures-util",
+ "http",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 
@@ -327,6 +330,7 @@ dependencies = [
  "serde_urlencoded",
  "smart-default",
  "tokio",
+ "tower-service",
  "uuid",
  "webpki-roots",
 ]
