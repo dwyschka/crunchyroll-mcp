@@ -39,10 +39,25 @@ async function main() {
     `Crunchyroll/ANDROIDTV/${credentials.version}_${credentials.version_code} ` +
     "(Android 13.0; en-US; TCL-S5400AF Build/TP1A.220624.014)";
   const deviceId = crypto.randomUUID();
+  // Same default headers as crunchyroll-rs.
+  const defaultHeaders = {
+    Accept: "*/*",
+    "Accept-Language": "en-US,en;q=0.5",
+    Connection: "keep-alive",
+    "User-Agent": userAgent,
+  };
+
+  // crunchyroll-rs requests the index page first to get the cookies Cloudflare's bot check wants.
+  const index = await fetch("https://www.crunchyroll.com", { headers: defaultHeaders });
+  const cookies = index.headers
+    .getSetCookie()
+    .map((cookie) => cookie.split(";")[0])
+    .join("; ");
+  await index.arrayBuffer();
 
   const body = new URLSearchParams({
     username: email,
-    password,
+    password: password,
     grant_type: "password",
     scope: "offline_access",
     device_id: deviceId,
@@ -53,14 +68,16 @@ async function main() {
   console.log(`E-Mail:       ${email}`);
   console.log(`Password:     <${[...password].length} characters>`);
   console.log(`Device ID:    ${deviceId}`);
+  console.log(`Index page:   ${index.status}, cookies: ${cookies || "none"}`);
   console.log(`POST ${TOKEN_URL}\n`);
 
   const response = await fetch(TOKEN_URL, {
     method: "POST",
     headers: {
+      ...defaultHeaders,
+      ...(cookies && { Cookie: cookies }),
       Authorization: `Basic ${credentials.basic_auth_token}`,
       "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": userAgent,
       "ETP-Anonymous-ID": deviceId,
     },
     body,
