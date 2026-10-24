@@ -299,6 +299,7 @@ dependencies = [
  "anyhow",
  "crunchyroll-rs",
  "dirs",
+ "form_urlencoded",
  "futures-util",
  "http",
  "reqwest",

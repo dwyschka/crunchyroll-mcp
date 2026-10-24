@@ -89,7 +89,31 @@ static DEV_MODE: LazyLock<bool> = LazyLock::new(|| {
 
 // ── Dev logging ──────────────────────────────────────────────────────────────
 
-/// Middleware that logs each response body to stderr and passes it on unchanged.
+/// Request body for the dev log; form fields are decoded and the password is masked.
+fn request_params(request: &reqwest::Request) -> Option<String> {
+    let body = request.body()?.as_bytes()?;
+    let is_form = request
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/x-www-form-urlencoded"));
+    if !is_form {
+        return Some(String::from_utf8_lossy(body).into_owned());
+    }
+
+    let fields = form_urlencoded::parse(body)
+        .map(|(key, value)| {
+            if key == "password" {
+                format!("  {key} = <{} Zeichen>", value.chars().count())
+            } else {
+                format!("  {key} = {value}")
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(fields.join("\n"))
+}
+
+/// Middleware that logs each request and response body to stderr and passes it on unchanged.
 struct ResponseLogger;
 
 impl<'a> tower_service::Service<MiddlewareContext<'a>> for ResponseLogger {
@@ -109,6 +133,10 @@ impl<'a> tower_service::Service<MiddlewareContext<'a>> for ResponseLogger {
 
             let method = request.method().clone();
             let url = request.url().clone();
+            match request_params(&request) {
+                Some(params) => eprintln!("[DEV] {method} {url}\n{params}"),
+                None => eprintln!("[DEV] {method} {url}"),
+            }
             let resp = client.execute(request).await?;
             let status = resp.status();
             let version = resp.version();
