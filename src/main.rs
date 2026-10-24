@@ -18,7 +18,10 @@ use uuid::Uuid;
 
 use crunchyroll_rs::{
     Crunchyroll, Locale, MediaCollection, MovieListing, Season, Series,
-    auth::{CrunchyrollBuilder, DeviceIdentifier, middleware::MiddlewareContext},
+    auth::{
+        CrunchyrollBuilder, DeviceIdentifier, DevicePlatform, middleware::MiddlewareContext,
+        platform_credentials::get_platform_credentials,
+    },
     list::WatchlistOptions,
     search::{BrowseMediaType, BrowseOptions, BrowseSortType},
 };
@@ -162,9 +165,40 @@ impl<'a> tower_service::Service<MiddlewareContext<'a>> for ResponseLogger {
     }
 }
 
+/// Current Android TV basic auth token and user agent, fetched once per process.
+/// The token bundled with crunchyroll-rs goes stale whenever Crunchyroll rotates it.
+static ANDROID_TV_CREDENTIALS: tokio::sync::OnceCell<(String, String)> =
+    tokio::sync::OnceCell::const_new();
+
+async fn android_tv_credentials() -> (String, String) {
+    let fetched = ANDROID_TV_CREDENTIALS
+        .get_or_try_init(|| async {
+            let credentials = get_platform_credentials().await?;
+            let user_agent = credentials.android_tv_user_agent();
+            eprintln!(
+                "Using Android TV credentials of app version {}",
+                credentials.android_tv.version
+            );
+            Ok::<_, reqwest::Error>((credentials.android_tv.basic_auth_token, user_agent))
+        })
+        .await;
+    match fetched {
+        Ok(credentials) => credentials.clone(),
+        Err(e) => {
+            eprintln!("Fetching current platform credentials failed, using bundled ones: {e}");
+            (
+                CrunchyrollBuilder::ANDROID_TV_BASIC_AUTH_TOKEN.to_string(),
+                CrunchyrollBuilder::ANDROID_TV_USER_AGENT.to_string(),
+            )
+        }
+    }
+}
+
 /// Crunchyroll client builder with the configured locales (and the dev logger if enabled).
-fn crunchyroll_builder() -> CrunchyrollBuilder {
+async fn crunchyroll_builder() -> CrunchyrollBuilder {
+    let (basic_auth_token, user_agent) = android_tv_credentials().await;
     let builder = Crunchyroll::builder()
+        .platform(DevicePlatform::TvAndroid, basic_auth_token, Some(user_agent))
         .locale(LOCALE.clone())
         .preferred_audio_locale(AUDIO_LOCALE.clone());
     if *DEV_MODE {
@@ -201,6 +235,7 @@ async fn login_with_credentials(
     device_type: &str,
 ) -> Result<Crunchyroll> {
     let cr = crunchyroll_builder()
+        .await
         .login_with_credentials(email, password, make_device(device_id, device_type))
         .await?;
     Ok(cr)
@@ -212,6 +247,7 @@ async fn login_with_refresh(
     device_type: &str,
 ) -> Result<Crunchyroll> {
     let cr = crunchyroll_builder()
+        .await
         .login_with_refresh_token(refresh_token, make_device(device_id, device_type))
         .await?;
     Ok(cr)
