@@ -7,7 +7,7 @@ COPY src ./src
 RUN cargo build --release --locked
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 RUN pip install --no-cache-dir uv \
     && uv tool install mcp-proxy
