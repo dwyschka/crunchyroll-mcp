@@ -11,6 +11,7 @@ services:
       - CRUNCHYROLL_LOCALE=${CRUNCHYROLL_LOCALE:-en-US}
       - CRUNCHYROLL_AUDIO_LOCALE=${CRUNCHYROLL_AUDIO_LOCALE:-ja-JP}
       - DEV_MODE=${DEV_MODE:-false}
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-}
     volumes:
       - crunchyroll_session:/root/.crunchyroll-mcp
 

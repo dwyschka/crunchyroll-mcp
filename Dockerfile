@@ -18,10 +18,6 @@ ENV PATH="/root/.local/bin:$PATH"
 
 EXPOSE 8808
 
-CMD ["mcp-proxy", \
-     "--host", "0.0.0.0", \
-     "--port", "8808", \
-     "--allow-origin", "*", \
-     "--pass-environment", \
-     "--", \
-     "crunchyroll-mcp"]
+# MCP_ALLOWED_HOSTS: comma-separated Host authorities (e.g. 10.10.50.216:8808 or
+# mcp.example.com:*) besides localhost that mcp-proxy accepts requests for.
+CMD ["sh", "-c", "set --; for h in $(echo \"$MCP_ALLOWED_HOSTS\" | tr ',' ' '); do set -- \"$@\" --allowed-host \"$h\"; done; exec mcp-proxy --host 0.0.0.0 --port 8808 --allow-origin '*' \"$@\" --pass-environment -- crunchyroll-mcp"]
