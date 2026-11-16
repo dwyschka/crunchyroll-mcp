@@ -116,10 +116,19 @@ fn request_params(request: &reqwest::Request) -> Option<String> {
     Some(fields.join("\n"))
 }
 
-/// Middleware that logs each request and response body to stderr and passes it on unchanged.
-struct ResponseLogger;
+/// Basic auth token crunchyroll-rs hardcodes for anonymous logins instead of the configured one.
+/// Crunchyroll deactivated it (`client_inactive`).
+const BUNDLED_ANONYMOUS_BASIC_AUTH: &str =
+    "Basic dC1rZGdwMmg4YzNqdWI4Zm4wZnE6eWZMRGZNZnJZdktYaDRKWFMxTEVJMmNDcXUxdjVXYW4=";
 
-impl<'a> tower_service::Service<MiddlewareContext<'a>> for ResponseLogger {
+/// Middleware that sends anonymous logins with the configured basic auth token and, in dev
+/// mode, logs each request and response body to stderr.
+struct ApiMiddleware {
+    basic_auth: http::HeaderValue,
+    log: bool,
+}
+
+impl<'a> tower_service::Service<MiddlewareContext<'a>> for ApiMiddleware {
     type Response = reqwest::Response;
     type Error = reqwest::Error;
     type Future = Pin<Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>>;
@@ -130,9 +139,20 @@ impl<'a> tower_service::Service<MiddlewareContext<'a>> for ResponseLogger {
 
     fn call(&mut self, ctx: MiddlewareContext<'a>) -> Self::Future {
         let client = ctx.client.clone();
-        let request = ctx.request;
+        let mut request = ctx.request;
+        let authorization = request.headers().get(reqwest::header::AUTHORIZATION);
+        if authorization.is_some_and(|v| v == BUNDLED_ANONYMOUS_BASIC_AUTH) {
+            request
+                .headers_mut()
+                .insert(reqwest::header::AUTHORIZATION, self.basic_auth.clone());
+        }
+        let log = self.log;
         Box::pin(async move {
             use reqwest::ResponseBuilderExt;
+
+            if !log {
+                return client.execute(request).await;
+            }
 
             let method = request.method().clone();
             let url = request.url().clone();
@@ -194,18 +214,19 @@ async fn android_tv_credentials() -> (String, String) {
     }
 }
 
-/// Crunchyroll client builder with the configured locales (and the dev logger if enabled).
+/// Crunchyroll client builder with the configured locales and the API middleware.
 async fn crunchyroll_builder() -> CrunchyrollBuilder {
     let (basic_auth_token, user_agent) = android_tv_credentials().await;
-    let builder = Crunchyroll::builder()
+    let middleware = ApiMiddleware {
+        basic_auth: http::HeaderValue::from_str(&format!("Basic {basic_auth_token}"))
+            .expect("basic auth token is a valid header value"),
+        log: *DEV_MODE,
+    };
+    Crunchyroll::builder()
         .platform(DevicePlatform::TvAndroid, basic_auth_token, Some(user_agent))
         .locale(LOCALE.clone())
-        .preferred_audio_locale(AUDIO_LOCALE.clone());
-    if *DEV_MODE {
-        builder.middleware(ResponseLogger)
-    } else {
-        builder
-    }
+        .preferred_audio_locale(AUDIO_LOCALE.clone())
+        .middleware(middleware)
 }
 
 // ── Shared state ─────────────────────────────────────────────────────────────
@@ -318,12 +339,36 @@ async fn login_from_env(state: &SharedState) -> Result<Crunchyroll, String> {
     Ok(cr)
 }
 
-/// Returns the active session, logging in from the environment if there is none.
+/// Starts an anonymous session; the catalog is available without an account.
+async fn login_anonymously(state: &SharedState) -> Result<Crunchyroll, String> {
+    let (device_id, device_type) = {
+        let s = state.lock().await;
+        (s.device_id.clone(), s.device_type.clone())
+    };
+    let cr = crunchyroll_builder()
+        .await
+        .login_anonymously(make_device(&device_id, &device_type))
+        .await
+        .map_err(|e| format!("Anonymous login failed: {e}"))?;
+
+    state.lock().await.crunchyroll = Some(cr.clone());
+    Ok(cr)
+}
+
+/// Returns the active session. Without one, logs in from the environment and falls back to an
+/// anonymous session for the catalog if there are no credentials or the login fails.
 async fn current_session(state: &SharedState) -> Result<Crunchyroll, Value> {
     if let Some(cr) = state.lock().await.crunchyroll.clone() {
         return Ok(cr);
     }
-    login_from_env(state).await.map_err(tool_err)
+    if env_credentials().is_some() {
+        match login_from_env(state).await {
+            Ok(cr) => return Ok(cr),
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+    eprintln!("Using an anonymous session");
+    login_anonymously(state).await.map_err(tool_err)
 }
 
 /// Whether a tool result failed because the session is expired or was revoked.
