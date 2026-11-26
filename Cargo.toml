@@ -8,7 +8,7 @@ name = "crunchyroll-mcp"
 path = "src/main.rs"
 
 [dependencies]
-crunchyroll-rs = { version = "0.19", features = ["middleware"] }
+crunchyroll-rs = { version = "0.20", features = ["middleware"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
